@@ -1,0 +1,172 @@
+module issue_queue #(
+    parameter IQ_SIZE = 8,
+    parameter PHYS_REG_IDX_W = 4,    // e.g. enough bits for physical reg index
+    parameter ROB_IDX_W = 4,
+    parameter OPCODE_W = 6
+) (
+    input  logic clk,
+    input  logic reset,
+    input  logic flush,                     // flush signal (branch mispredict etc.)
+
+    // Dispatch inputs
+    input  logic dispatch_en,
+    input  logic [OPCODE_W-1:0] dispatch_opcode,
+    input  logic [PHYS_REG_IDX_W-1:0] dispatch_rs1_tag,
+    input  logic dispatch_rs1_ready,
+    input  logic [PHYS_REG_IDX_W-1:0] dispatch_rs2_tag,
+    input  logic dispatch_rs2_ready,
+    input  logic [PHYS_REG_IDX_W-1:0] dispatch_dest_tag,
+    input  logic [ROB_IDX_W-1:0] dispatch_rob_idx,
+
+    // CDB broadcast for wakeup
+    input  logic cdb_valid,
+    input  logic [PHYS_REG_IDX_W-1:0] cdb_tag,
+
+    // Issue outputs
+    output logic issue_valid,
+    output logic [OPCODE_W-1:0] issue_opcode,
+    output logic [PHYS_REG_IDX_W-1:0] issue_dest_tag,
+    output logic [ROB_IDX_W-1:0] issue_rob_idx,
+
+    output logic [PHYS_REG_IDX_W-1:0] issue_rs1_tag,
+    output logic issue_rs1_ready,
+    output logic [PHYS_REG_IDX_W-1:0] issue_rs2_tag,
+    output logic issue_rs2_ready,
+
+    output logic issue_rs1_wakeup,    // Optional: indicates which operands were woken up this cycle
+    output logic issue_rs2_wakeup,
+
+    output logic iq_full
+);
+
+    typedef struct packed {
+        logic valid;
+        logic [OPCODE_W-1:0] opcode;
+        logic [PHYS_REG_IDX_W-1:0] rs1_tag;
+        logic rs1_ready;
+        logic [PHYS_REG_IDX_W-1:0] rs2_tag;
+        logic rs2_ready;
+        logic [PHYS_REG_IDX_W-1:0] dest_tag;
+        logic [ROB_IDX_W-1:0] rob_idx;
+    } iq_entry_t;
+
+    iq_entry_t iq [IQ_SIZE];
+
+    // Dispatch pointer - insert new instruction in first invalid slot
+    // Full if no invalid entries
+    logic [IQ_SIZE-1:0] free_entries;
+    assign free_entries = ~{iq[0].valid, iq[1].valid, iq[2].valid, iq[3].valid,
+                            iq[4].valid, iq[5].valid, iq[6].valid, iq[7].valid};
+    assign iq_full = (free_entries == 8'b0);
+
+    // Find first free slot (lowest index)
+    logic [2:0] dispatch_slot;
+    integer i;
+    always_comb begin
+        dispatch_slot = 0;
+        for (i = 0; i < IQ_SIZE; i++) begin
+            if (!iq[i].valid) begin
+                dispatch_slot = i;
+                break;
+            end
+        end
+    end
+
+    // Wakeup logic: for each entry, check if cdb_tag matches rs1_tag or rs2_tag and rs*_ready==0
+    logic [IQ_SIZE-1:0] rs1_wakeup_mask, rs2_wakeup_mask;
+
+    always_comb begin
+        for (int j = 0; j < IQ_SIZE; j++) begin
+            rs1_wakeup_mask[j] = (iq[j].valid && !iq[j].rs1_ready && cdb_valid && (iq[j].rs1_tag == cdb_tag));
+            rs2_wakeup_mask[j] = (iq[j].valid && !iq[j].rs2_ready && cdb_valid && (iq[j].rs2_tag == cdb_tag));
+        end
+    end
+
+    // Issue selection: find oldest ready instruction (valid && rs1_ready && rs2_ready)
+    // Oldest = smallest rob_idx (priority)
+    logic [IQ_SIZE-1:0] ready_mask;
+    logic issue_found;
+    logic [ROB_IDX_W-1:0] min_rob_idx;
+    logic [2:0] issue_slot;
+
+    always_comb begin
+        ready_mask = '0;
+        for (int k = 0; k < IQ_SIZE; k++) begin
+            ready_mask[k] = (iq[k].valid && iq[k].rs1_ready && iq[k].rs2_ready);
+        end
+
+        issue_found = 0;
+        min_rob_idx = {ROB_IDX_W{1'b1}}; // max value
+        issue_slot = 0;
+        for (int m = 0; m < IQ_SIZE; m++) begin
+            if (ready_mask[m]) begin
+                if (!issue_found || (iq[m].rob_idx < min_rob_idx)) begin
+                    min_rob_idx = iq[m].rob_idx;
+                    issue_slot = m;
+                    issue_found = 1;
+                end
+            end
+        end
+    end
+
+    // Outputs
+    assign issue_valid     = issue_found;
+    assign issue_opcode    = issue_found ? iq[issue_slot].opcode    : '0;
+    assign issue_dest_tag  = issue_found ? iq[issue_slot].dest_tag  : '0;
+    assign issue_rob_idx   = issue_found ? iq[issue_slot].rob_idx   : '0;
+    assign issue_rs1_tag   = issue_found ? iq[issue_slot].rs1_tag   : '0;
+    assign issue_rs1_ready = issue_found ? iq[issue_slot].rs1_ready : 1'b0;
+    assign issue_rs2_tag   = issue_found ? iq[issue_slot].rs2_tag   : '0;
+    assign issue_rs2_ready = issue_found ? iq[issue_slot].rs2_ready : 1'b0;
+
+    // Optional: indicate which operands were woken up this cycle for the issued instruction
+    assign issue_rs1_wakeup = issue_found ? rs1_wakeup_mask[issue_slot] : 1'b0;
+    assign issue_rs2_wakeup = issue_found ? rs2_wakeup_mask[issue_slot] : 1'b0;
+
+    // Main sequential logic
+    always_ff @(posedge clk or posedge reset) begin
+        if (reset) begin
+            for (int idx = 0; idx < IQ_SIZE; idx++) begin
+                iq[idx].valid      <= 1'b0;
+                iq[idx].opcode     <= '0;
+                iq[idx].rs1_tag    <= '0;
+                iq[idx].rs1_ready  <= 1'b0;
+                iq[idx].rs2_tag    <= '0;
+                iq[idx].rs2_ready  <= 1'b0;
+                iq[idx].dest_tag   <= '0;
+                iq[idx].rob_idx    <= '0;
+            end
+        end else if (flush) begin
+            // On flush, clear all IQ entries
+            for (int idx = 0; idx < IQ_SIZE; idx++) begin
+                iq[idx].valid <= 1'b0;
+            end
+        end else begin
+            // Wakeup operands if CDB matches
+            for (int idx = 0; idx < IQ_SIZE; idx++) begin
+                if (iq[idx].valid) begin
+                    if (rs1_wakeup_mask[idx]) iq[idx].rs1_ready <= 1'b1;
+                    if (rs2_wakeup_mask[idx]) iq[idx].rs2_ready <= 1'b1;
+                end
+            end
+
+            // Issue selected instruction: mark invalid
+            if (issue_found) begin
+                iq[issue_slot].valid <= 1'b0;
+            end
+
+            // Dispatch new instruction if valid and IQ not full
+            if (dispatch_en && !iq_full) begin
+                iq[dispatch_slot].valid     <= 1'b1;
+                iq[dispatch_slot].opcode    <= dispatch_opcode;
+                iq[dispatch_slot].rs1_tag   <= dispatch_rs1_tag;
+                iq[dispatch_slot].rs1_ready <= dispatch_rs1_ready;
+                iq[dispatch_slot].rs2_tag   <= dispatch_rs2_tag;
+                iq[dispatch_slot].rs2_ready <= dispatch_rs2_ready;
+                iq[dispatch_slot].dest_tag  <= dispatch_dest_tag;
+                iq[dispatch_slot].rob_idx   <= dispatch_rob_idx;
+            end
+        end
+    end
+
+endmodule
