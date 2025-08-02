@@ -1,0 +1,127 @@
+parameter NUM_ARCH_REGS = 8;    // e.g., R0-R7
+parameter NUM_PHYS_REGS = 16;   // e.g., P0-P15
+parameter NUM_CHECKPOINTS = 4;  // Number of checkpoints to store
+
+// Calculate widths for register indices
+parameter ARCH_REG_IDX_W = $clog2(NUM_ARCH_REGS);
+parameter PHYS_REG_IDX_W = $clog2(NUM_PHYS_REGS);
+parameter CHECKPOINT_IDX_W = $clog2(NUM_CHECKPOINTS);
+
+module register_renaming_unit_checkpointed (
+    input logic clk,
+    input logic reset,
+
+    // Inputs from the Rename Stage
+    input logic [ARCH_REG_IDX_W-1:0]  arch_reg_read_idx_rs1,  // Architectural register for source 1
+    input logic [ARCH_REG_IDX_W-1:0]  arch_reg_read_idx_rs2,  // Architectural register for source 2
+    input logic [ARCH_REG_IDX_W-1:0]  arch_reg_write_idx,     // Architectural register to write
+
+    input logic                       rename_en,             // Enable renaming (RAT update and FL allocation)
+    input logic                       allocate_phys_reg_req, // Request a free physical register
+    input logic [PHYS_REG_IDX_W-1:0]  release_phys_reg_val,  // Physical register to release
+    input logic                       release_phys_reg_en,   // Enable releasing physical register
+
+    // Outputs to the Rename Stage
+    output logic [PHYS_REG_IDX_W-1:0] phys_reg_read_val_rs1, // Physical register for source 1
+    output logic [PHYS_REG_IDX_W-1:0] phys_reg_read_val_rs2, // Physical register for source 2
+    output logic [PHYS_REG_IDX_W-1:0] new_phys_reg_write_val, // Newly allocated physical register
+
+    // Checkpointing and Recovery Signals
+    input logic                       save_checkpoint_en,    // Enable saving a checkpoint
+    input logic [CHECKPOINT_IDX_W-1:0] save_checkpoint_idx,  // Index to save the checkpoint
+    input logic                       restore_checkpoint_en, // Enable restoring a checkpoint
+    input logic [CHECKPOINT_IDX_W-1:0] restore_checkpoint_idx // Index to restore the checkpoint from
+);
+
+    //-------------------------------------------------------------------------
+    // Register Alias Table (RAT)
+    // Maps architectural register IDs to physical register IDs (speculative)
+    //-------------------------------------------------------------------------
+    logic [PHYS_REG_IDX_W-1:0] rat_table [NUM_ARCH_REGS-1:0];
+
+    // Checkpointed RAT states
+    logic [PHYS_REG_IDX_W-1:0] checkpointed_rat [NUM_CHECKPOINTS-1:0][NUM_ARCH_REGS-1:0];
+
+    // Read from RAT
+    assign phys_reg_read_val_rs1 = rat_table[arch_reg_read_idx_rs1];
+    assign phys_reg_read_val_rs2 = rat_table[arch_reg_read_idx_rs2];
+
+    //-------------------------------------------------------------------------
+    // Free List (FL)
+    // Manages the allocation and deallocation of physical registers
+    // Implemented as a bitmap and a pointer for next available register
+    //-------------------------------------------------------------------------
+    logic [NUM_PHYS_REGS-1:0]   free_list_bitmap;
+    logic [PHYS_REG_IDX_W-1:0]  free_list_head; // Pointer to the next available physical register
+
+    // Checkpointed Free List bitmaps
+    logic [NUM_PHYS_REGS-1:0]   checkpointed_free_list_bitmap [NUM_CHECKPOINTS-1:0];
+    logic [PHYS_REG_IDX_W-1:0]  checkpointed_free_list_head [NUM_CHECKPOINTS-1:0];
+
+    // Allocate a new physical register (combinational)
+    always_comb begin
+        new_phys_reg_write_val = free_list_head; // Assign the next available physical register
+    end
+
+    //-------------------------------------------------------------------------
+    // Main Sequential Logic (RAT, Free List, Checkpointing)
+    //-------------------------------------------------------------------------
+    always_ff @(posedge clk or posedge reset) begin
+        if (reset) begin
+            // Initialize RAT
+            for (int i = 0; i < NUM_ARCH_REGS; i++) begin
+                rat_table[i] <= i; // Initial one-to-one mapping
+            end
+            // Initialize Free List
+            free_list_bitmap <= {NUM_PHYS_REGS{1'b1}}; // All physical registers are free
+            free_list_head   <= 0;
+            // Initialize Checkpoints (can be done with initial values or left undefined if not used initially)
+            for (int j = 0; j < NUM_CHECKPOINTS; j++) begin
+                for (int i = 0; i < NUM_ARCH_REGS; i++) begin
+                    checkpointed_rat[j][i] <= i;
+                end
+                checkpointed_free_list_bitmap[j] <= {NUM_PHYS_REGS{1'b1}};
+                checkpointed_free_list_head[j]   <= 0;
+            end
+        end else begin
+            // 1. Checkpoint Saving Logic
+            if (save_checkpoint_en) begin
+                checkpointed_rat[save_checkpoint_idx]         <= rat_table;
+                checkpointed_free_list_bitmap[save_checkpoint_idx] <= free_list_bitmap;
+                checkpointed_free_list_head[save_checkpoint_idx]   <= free_list_head;
+            end
+
+            // 2. Checkpoint Restoration Logic
+            if (restore_checkpoint_en) begin
+                rat_table        <= checkpointed_rat[restore_checkpoint_idx];
+                free_list_bitmap <= checkpointed_free_list_bitmap[restore_checkpoint_idx];
+                free_list_head   <= checkpointed_free_list_head[restore_checkpoint_idx];
+            end
+
+            // 3. Normal Renaming Operations (if not restoring)
+            if (~restore_checkpoint_en) begin // Only update if not restoring from a checkpoint
+                // Update RAT on rename (assign new physical register to architectural register)
+                if (rename_en && allocate_phys_reg_req) begin
+                    rat_table[arch_reg_write_idx] <= new_phys_reg_write_val;
+                end
+
+                // Allocate a new physical register
+                if (rename_en && allocate_phys_reg_req) begin
+                    free_list_bitmap[free_list_head] <= 1'b0; // Mark as allocated
+                    // Find next free physical register
+                    for (int i = 0; i < NUM_PHYS_REGS; i++) begin
+                        if (free_list_bitmap[i] == 1'b1) begin
+                            free_list_head <= i;
+                            break;
+                        end
+                    end
+                end
+
+                // Release a physical register (e.g., from the Reorder Buffer or on retirement)
+                if (release_phys_reg_en) begin
+                    free_list_bitmap[release_phys_reg_val] <= 1'b1; // Mark as free
+                end
+            end
+        end
+    end
+endmodule
