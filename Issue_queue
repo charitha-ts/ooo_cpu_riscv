@@ -18,23 +18,39 @@ module issue_queue #(
     input  logic [PHYS_REG_IDX_W-1:0] dispatch_dest_tag,
     input  logic [ROB_IDX_W-1:0] dispatch_rob_idx,
 
-    // CDB broadcast for wakeup
-    input  logic cdb_valid,
-    input  logic [PHYS_REG_IDX_W-1:0] cdb_tag,
+    // CDB broadcast for wakeup - 2 CDBs (for 2 FUs)
+    input  logic cdb0_valid,
+    input  logic [PHYS_REG_IDX_W-1:0] cdb0_tag,
+    input  logic cdb1_valid,
+    input  logic [PHYS_REG_IDX_W-1:0] cdb1_tag,
 
-    // Issue outputs
-    output logic issue_valid,
-    output logic [OPCODE_W-1:0] issue_opcode,
-    output logic [PHYS_REG_IDX_W-1:0] issue_dest_tag,
-    output logic [ROB_IDX_W-1:0] issue_rob_idx,
+    // Functional Unit ready signals
+    input  logic fu0_ready,
+    input  logic fu1_ready,
 
-    output logic [PHYS_REG_IDX_W-1:0] issue_rs1_tag,
-    output logic issue_rs1_ready,
-    output logic [PHYS_REG_IDX_W-1:0] issue_rs2_tag,
-    output logic issue_rs2_ready,
+    // Issue outputs for FU0
+    output logic issue0_valid,
+    output logic [OPCODE_W-1:0] issue0_opcode,
+    output logic [PHYS_REG_IDX_W-1:0] issue0_dest_tag,
+    output logic [ROB_IDX_W-1:0] issue0_rob_idx,
+    output logic [PHYS_REG_IDX_W-1:0] issue0_rs1_tag,
+    output logic issue0_rs1_ready,
+    output logic [PHYS_REG_IDX_W-1:0] issue0_rs2_tag,
+    output logic issue0_rs2_ready,
+    output logic issue0_rs1_wakeup,
+    output logic issue0_rs2_wakeup,
 
-    output logic issue_rs1_wakeup,    // Optional: indicates which operands were woken up this cycle
-    output logic issue_rs2_wakeup,
+    // Issue outputs for FU1
+    output logic issue1_valid,
+    output logic [OPCODE_W-1:0] issue1_opcode,
+    output logic [PHYS_REG_IDX_W-1:0] issue1_dest_tag,
+    output logic [ROB_IDX_W-1:0] issue1_rob_idx,
+    output logic [PHYS_REG_IDX_W-1:0] issue1_rs1_tag,
+    output logic issue1_rs1_ready,
+    output logic [PHYS_REG_IDX_W-1:0] issue1_rs2_tag,
+    output logic issue1_rs2_ready,
+    output logic issue1_rs1_wakeup,
+    output logic issue1_rs2_wakeup,
 
     output logic iq_full
 );
@@ -52,14 +68,13 @@ module issue_queue #(
 
     iq_entry_t iq [IQ_SIZE];
 
-    // Dispatch pointer - insert new instruction in first invalid slot
-    // Full if no invalid entries
+    // Free entries mask and full signal
     logic [IQ_SIZE-1:0] free_entries;
     assign free_entries = ~{iq[0].valid, iq[1].valid, iq[2].valid, iq[3].valid,
                             iq[4].valid, iq[5].valid, iq[6].valid, iq[7].valid};
     assign iq_full = (free_entries == 8'b0);
 
-    // Find first free slot (lowest index)
+    // Find first free slot for dispatch
     logic [2:0] dispatch_slot;
     integer i;
     always_comb begin
@@ -72,56 +87,99 @@ module issue_queue #(
         end
     end
 
-    // Wakeup logic: for each entry, check if cdb_tag matches rs1_tag or rs2_tag and rs*_ready==0
-    logic [IQ_SIZE-1:0] rs1_wakeup_mask, rs2_wakeup_mask;
+    // Wakeup logic for 2 CDBs
+    logic [IQ_SIZE-1:0] rs1_wakeup_mask_cdb0, rs2_wakeup_mask_cdb0;
+    logic [IQ_SIZE-1:0] rs1_wakeup_mask_cdb1, rs2_wakeup_mask_cdb1;
 
     always_comb begin
         for (int j = 0; j < IQ_SIZE; j++) begin
-            rs1_wakeup_mask[j] = (iq[j].valid && !iq[j].rs1_ready && cdb_valid && (iq[j].rs1_tag == cdb_tag));
-            rs2_wakeup_mask[j] = (iq[j].valid && !iq[j].rs2_ready && cdb_valid && (iq[j].rs2_tag == cdb_tag));
+            rs1_wakeup_mask_cdb0[j] = (iq[j].valid && !iq[j].rs1_ready && cdb0_valid && (iq[j].rs1_tag == cdb0_tag));
+            rs2_wakeup_mask_cdb0[j] = (iq[j].valid && !iq[j].rs2_ready && cdb0_valid && (iq[j].rs2_tag == cdb0_tag));
+            rs1_wakeup_mask_cdb1[j] = (iq[j].valid && !iq[j].rs1_ready && cdb1_valid && (iq[j].rs1_tag == cdb1_tag));
+            rs2_wakeup_mask_cdb1[j] = (iq[j].valid && !iq[j].rs2_ready && cdb1_valid && (iq[j].rs2_tag == cdb1_tag));
         end
     end
 
-    // Issue selection: find oldest ready instruction (valid && rs1_ready && rs2_ready)
-    // Oldest = smallest rob_idx (priority)
-    logic [IQ_SIZE-1:0] ready_mask;
-    logic issue_found;
-    logic [ROB_IDX_W-1:0] min_rob_idx;
-    logic [2:0] issue_slot;
+    // Combine wakeup masks from both CDBs
+    logic [IQ_SIZE-1:0] rs1_wakeup_mask, rs2_wakeup_mask;
+    assign rs1_wakeup_mask = rs1_wakeup_mask_cdb0 | rs1_wakeup_mask_cdb1;
+    assign rs2_wakeup_mask = rs2_wakeup_mask_cdb0 | rs2_wakeup_mask_cdb1;
 
+    // Ready mask for instructions with both operands ready
+    logic [IQ_SIZE-1:0] ready_mask;
     always_comb begin
-        ready_mask = '0;
         for (int k = 0; k < IQ_SIZE; k++) begin
             ready_mask[k] = (iq[k].valid && iq[k].rs1_ready && iq[k].rs2_ready);
         end
+    end
 
-        issue_found = 0;
-        min_rob_idx = {ROB_IDX_W{1'b1}}; // max value
-        issue_slot = 0;
+    // Find the oldest ready instruction for FU0
+    logic issue0_found;
+    logic [ROB_IDX_W-1:0] issue0_min_rob_idx;
+    logic [2:0] issue0_slot;
+
+    always_comb begin
+        issue0_found = 0;
+        issue0_min_rob_idx = {ROB_IDX_W{1'b1}}; // max value
+        issue0_slot = 0;
+
         for (int m = 0; m < IQ_SIZE; m++) begin
             if (ready_mask[m]) begin
-                if (!issue_found || (iq[m].rob_idx < min_rob_idx)) begin
-                    min_rob_idx = iq[m].rob_idx;
-                    issue_slot = m;
-                    issue_found = 1;
+                if (!issue0_found || (iq[m].rob_idx < issue0_min_rob_idx)) begin
+                    issue0_min_rob_idx = iq[m].rob_idx;
+                    issue0_slot = m;
+                    issue0_found = 1;
                 end
             end
         end
     end
 
-    // Outputs
-    assign issue_valid     = issue_found;
-    assign issue_opcode    = issue_found ? iq[issue_slot].opcode    : '0;
-    assign issue_dest_tag  = issue_found ? iq[issue_slot].dest_tag  : '0;
-    assign issue_rob_idx   = issue_found ? iq[issue_slot].rob_idx   : '0;
-    assign issue_rs1_tag   = issue_found ? iq[issue_slot].rs1_tag   : '0;
-    assign issue_rs1_ready = issue_found ? iq[issue_slot].rs1_ready : 1'b0;
-    assign issue_rs2_tag   = issue_found ? iq[issue_slot].rs2_tag   : '0;
-    assign issue_rs2_ready = issue_found ? iq[issue_slot].rs2_ready : 1'b0;
+    // Find the oldest ready instruction for FU1, excluding FU0's chosen instruction
+    logic issue1_found;
+    logic [ROB_IDX_W-1:0] issue1_min_rob_idx;
+    logic [2:0] issue1_slot;
 
-    // Optional: indicate which operands were woken up this cycle for the issued instruction
-    assign issue_rs1_wakeup = issue_found ? rs1_wakeup_mask[issue_slot] : 1'b0;
-    assign issue_rs2_wakeup = issue_found ? rs2_wakeup_mask[issue_slot] : 1'b0;
+    always_comb begin
+        issue1_found = 0;
+        issue1_min_rob_idx = {ROB_IDX_W{1'b1}};
+        issue1_slot = 0;
+
+        for (int n = 0; n < IQ_SIZE; n++) begin
+            if (ready_mask[n] && n != issue0_slot) begin
+                if (!issue1_found || (iq[n].rob_idx < issue1_min_rob_idx)) begin
+                    issue1_min_rob_idx = iq[n].rob_idx;
+                    issue1_slot = n;
+                    issue1_found = 1;
+                end
+            end
+        end
+    end
+
+    // Gate issue with FU readiness
+    assign issue0_valid = issue0_found && fu0_ready;
+    assign issue1_valid = issue1_found && fu1_ready;
+
+    // Outputs for FU0
+    assign issue0_opcode    = issue0_valid ? iq[issue0_slot].opcode    : '0;
+    assign issue0_dest_tag  = issue0_valid ? iq[issue0_slot].dest_tag  : '0;
+    assign issue0_rob_idx   = issue0_valid ? iq[issue0_slot].rob_idx   : '0;
+    assign issue0_rs1_tag   = issue0_valid ? iq[issue0_slot].rs1_tag   : '0;
+    assign issue0_rs1_ready = issue0_valid ? iq[issue0_slot].rs1_ready : 1'b0;
+    assign issue0_rs2_tag   = issue0_valid ? iq[issue0_slot].rs2_tag   : '0;
+    assign issue0_rs2_ready = issue0_valid ? iq[issue0_slot].rs2_ready : 1'b0;
+    assign issue0_rs1_wakeup= issue0_valid ? rs1_wakeup_mask[issue0_slot] : 1'b0;
+    assign issue0_rs2_wakeup= issue0_valid ? rs2_wakeup_mask[issue0_slot] : 1'b0;
+
+    // Outputs for FU1
+    assign issue1_opcode    = issue1_valid ? iq[issue1_slot].opcode    : '0;
+    assign issue1_dest_tag  = issue1_valid ? iq[issue1_slot].dest_tag  : '0;
+    assign issue1_rob_idx   = issue1_valid ? iq[issue1_slot].rob_idx   : '0;
+    assign issue1_rs1_tag   = issue1_valid ? iq[issue1_slot].rs1_tag   : '0;
+    assign issue1_rs1_ready = issue1_valid ? iq[issue1_slot].rs1_ready : 1'b0;
+    assign issue1_rs2_tag   = issue1_valid ? iq[issue1_slot].rs2_tag   : '0;
+    assign issue1_rs2_ready = issue1_valid ? iq[issue1_slot].rs2_ready : 1'b0;
+    assign issue1_rs1_wakeup= issue1_valid ? rs1_wakeup_mask[issue1_slot] : 1'b0;
+    assign issue1_rs2_wakeup= issue1_valid ? rs2_wakeup_mask[issue1_slot] : 1'b0;
 
     // Main sequential logic
     always_ff @(posedge clk or posedge reset) begin
@@ -150,10 +208,9 @@ module issue_queue #(
                 end
             end
 
-            // Issue selected instruction: mark invalid
-            if (issue_found) begin
-                iq[issue_slot].valid <= 1'b0;
-            end
+            // Issue instructions: clear only if FU accepted instruction
+            if (issue0_valid) iq[issue0_slot].valid <= 1'b0;
+            if (issue1_valid) iq[issue1_slot].valid <= 1'b0;
 
             // Dispatch new instruction if valid and IQ not full
             if (dispatch_en && !iq_full) begin
