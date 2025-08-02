@@ -1,0 +1,99 @@
+module branch_predictor_with_btb (
+    input  wire        clk,
+    input  wire        reset,
+
+    // Fetch stage input
+    input  wire [31:0] current_pc,
+
+    // Execute stage inputs (actual branch resolution)
+    input  wire        branch_taken_actual,
+    input  wire [31:0] branch_target_actual,
+    input  wire [31:0] resolve_pc,         // PC of the branch being resolved
+
+    // Prediction outputs (used in fetch stage)
+    output reg         predict_taken,
+    output reg [31:0]  predicted_target_address,
+
+    // Misprediction output
+    output reg         mispredict
+);
+
+    // Define BTB parameters
+    parameter BTB_SIZE = 64;
+    parameter ADDR_WIDTH = 32;
+
+    // BTB memory structure
+    reg [ADDR_WIDTH-1:0] btb_tag [BTB_SIZE-1:0];
+    reg [ADDR_WIDTH-1:0] btb_target [BTB_SIZE-1:0];
+    reg [1:0]            btb_prediction_state [BTB_SIZE-1:0]; // 2-bit saturating counter
+
+    // Index for fetch stage
+    wire [5:0] fetch_index   = current_pc[5:0];
+
+    // Index for execute stage resolution
+    wire [5:0] resolve_index = resolve_pc[5:0];
+
+    // =====================
+    // Prediction Logic
+    // =====================
+    always @(*) begin
+        predict_taken = 1'b0;
+        predicted_target_address = current_pc + 4; // Default to sequential fetch
+
+        if (btb_tag[fetch_index] == current_pc) begin // BTB hit
+            if (btb_prediction_state[fetch_index] >= 2) begin // Weakly Taken or Strongly Taken
+                predict_taken = 1'b1;
+                predicted_target_address = btb_target[fetch_index];
+            end
+        end
+    end
+
+    // =====================
+    // BTB Update + Mispredict Detection
+    // =====================
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            mispredict <= 1'b0;
+        end else begin
+            // Default mispredict low unless triggered
+            mispredict <= 1'b0;
+
+            // Check if the branch is in the BTB
+            if (btb_tag[resolve_index] == resolve_pc) begin
+                // --- Detect misprediction ---
+                // Mispredict if:
+                // 1. Predicted direction != actual direction OR
+                // 2. Predicted taken but BTB target != actual target
+                if ((btb_prediction_state[resolve_index][1] != branch_taken_actual) ||
+                    (branch_taken_actual && btb_target[resolve_index] != branch_target_actual)) begin
+                    mispredict <= 1'b1;
+                end
+
+                // --- Update the prediction counter ---
+                if (branch_taken_actual) begin
+                    if (btb_prediction_state[resolve_index] < 3)
+                        btb_prediction_state[resolve_index] <= btb_prediction_state[resolve_index] + 1;
+                end else begin
+                    if (btb_prediction_state[resolve_index] > 0)
+                        btb_prediction_state[resolve_index] <= btb_prediction_state[resolve_index] - 1;
+                end
+
+                // --- Update target if needed ---
+                if (branch_taken_actual && btb_target[resolve_index] != branch_target_actual) begin
+                    btb_target[resolve_index] <= branch_target_actual;
+                end
+
+            end else begin
+                // --- BTB miss -> new entry ---
+                btb_tag[resolve_index] <= resolve_pc;
+                btb_target[resolve_index] <= branch_target_actual;
+                btb_prediction_state[resolve_index] <= (branch_taken_actual ? 2'b10 : 2'b01);
+
+                // If we thought it was not in BTB, that’s effectively a mispredict if it was actually taken
+                if (branch_taken_actual)
+                    mispredict <= 1'b1;
+            end
+        end
+    end
+
+endmodule
